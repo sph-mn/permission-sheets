@@ -1,0 +1,86 @@
+#!/usr/bin/env node
+"use strict";
+
+function permission_mode(text, directory) {
+  if (text === undefined) {
+    return "";
+  }
+
+  const parts = text.split(",");
+  while (parts.length < 3) {
+    parts.push("");
+  }
+  return parts.map(part => {
+    const read = part.includes("r");
+    return 4 * read + 2 * part.includes("w") + Number(part.includes("x") || directory && read);
+  }).join("");
+}
+
+function shell_quote(text) {
+  return "'" + text.replaceAll("'", "'\"'\"'") + "'";
+}
+
+function emit_rule(lines, selectors, declaration) {
+  const ownership = declaration.owner
+    ? declaration.owner + (declaration.group ? ":" + declaration.group : "")
+    : declaration.group ? ":" + declaration.group : "";
+  const file_mode = permission_mode(declaration.file_permissions ?? declaration.permissions, false);
+  const directory_mode = permission_mode(declaration.directory_permissions ?? declaration.permissions, true);
+  const commands = [];
+
+  if (declaration.recursive) {
+    if (ownership) {
+      commands.push(`find "$path" ! -type l -exec chown ${shell_quote(ownership)} {} +`);
+    }
+    const actions = [];
+    if (directory_mode) {
+      actions.push(`-type d -exec chmod '${directory_mode}' {} +`);
+    }
+    if (file_mode) {
+      actions.push(`! -type d ! -type l -exec chmod '${file_mode}' {} +`);
+    }
+    if (actions.length) {
+      commands.push(`find "$path" ${actions.join(" -o ")}`);
+    }
+  } else {
+    if (ownership) {
+      commands.push(`chown ${shell_quote(ownership)} "$path"`);
+    }
+    if (file_mode && directory_mode) {
+      commands.push(`if test -d "$path"; then chmod '${directory_mode}' "$path"; else chmod '${file_mode}' "$path"; fi`);
+    } else if (file_mode) {
+      commands.push(`if ! test -d "$path"; then chmod '${file_mode}' "$path"; fi`);
+    } else if (directory_mode) {
+      commands.push(`if test -d "$path"; then chmod '${directory_mode}' "$path"; fi`);
+    }
+  }
+
+  if (commands.length) {
+    lines.push(`for path in ${selectors.join(" ")}; do`, '  test -e "$path" || continue');
+    lines.push(...commands.map(command => "  " + command));
+    lines.push("done", "");
+  }
+}
+
+function emit_rule_tree(lines, rule, parent) {
+  const selectors = (Array.isArray(rule[0]) ? rule[0] : [rule[0]]).map(selector =>
+    !parent || selector.startsWith("/") ? selector :
+      parent + (parent.endsWith("/") ? "" : "/") + selector
+  );
+  const declaration = Array.isArray(rule[1]) ? undefined : rule[1];
+
+  if (declaration) {
+    emit_rule(lines, selectors, declaration);
+  }
+  for (const child of rule.slice(declaration ? 2 : 1)) {
+    for (const selector of selectors) {
+      emit_rule_tree(lines, child, selector);
+    }
+  }
+}
+
+const lines = ["#!/bin/sh", "set -e", ""];
+for (const rule of JSON.parse("[\n" + require("node:fs").readFileSync(0, "utf8") + "\n]")) {
+  emit_rule_tree(lines, rule, "");
+}
+process.stdout.write(lines.join("\n") + "\n");
